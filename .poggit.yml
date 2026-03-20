@@ -1,0 +1,9 @@
+---
+branches:
+  - main
+projects:
+  session-utils:
+    path: ""
+    model: virion
+    type: library
+...
