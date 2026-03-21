@@ -30,6 +30,7 @@
 
 - 플레이어 접속/퇴장 시 세션 자동 생성 및 소멸 (라이프사이클 세션)
 - `#[SessionEventHandler]` 어트리뷰트로 세션에 PMMP 이벤트 자동 라우팅 — 별도 리스너 클래스 불필요
+- `SessionSequence`를 통한 튜토리얼 등 다단계 흐름의 순차적 세션 진행 지원
 - 전역 레지스트리를 통해 여러 세션 타입 간 PMMP 리스너 중복 등록 방지
 - 타입 안전한 제네릭 `SessionManager<T>` 제공
 
@@ -49,24 +50,21 @@ classDiagram
 direction LR
 
 class Session {
-    <<interface>>
-    +getPlayer() Player
-    +isActive() bool
-    +start() void
-    +terminate(reason) void
-}
-
-class AbstractSession {
+    <<abstract>>
     -Player player
-    -SessionManager manager
+    -SessionManager sessionManager
     -bool active
     +getPlayer() Player
     +isActive() bool
     +start() void
     +terminate(reason) void
-    #close(reason) void
     #onStart() void
     #onTerminate(reason) void
+}
+
+class SequenceSession {
+    <<abstract>>
+    #next(reason) void
 }
 
 class LifecycleSession {
@@ -81,6 +79,20 @@ class SessionManager~T extends Session~ {
     +getAllSessions() list~T~
     +removeSession(session, reason) void
     +terminateAll(reason) int
+    +getSessionClass() class-string
+}
+
+class SequenceSessionManager {
+    +setNext(manager) void
+    +setOnExhausted(callback) void
+    +progressNext(player, reason) void
+}
+
+class SessionSequence {
+    +start(player) void
+    +startFrom(player, step) void
+    +onComplete(callback) self
+    +terminateAll(reason) void
 }
 
 class SessionEventListenerRegistry {
@@ -116,8 +128,11 @@ class SessionEventHandler {
     +bool handleCancelled
 }
 
-Session <|.. AbstractSession
-AbstractSession <|-- LifecycleSession
+Session <|-- SequenceSession
+Session <|-- LifecycleSession
+SessionManager <|-- SequenceSessionManager
+SessionSequence --> SequenceSessionManager : creates and chains
+SequenceSessionManager --> SequenceSession : manages
 SessionManager --> Session : manages
 SessionManager --> SessionEventListenerRegistry : registers via
 SessionEventListenerRegistry --> SessionEventListener : owns one per eventKey
@@ -140,23 +155,41 @@ PMMP 이벤트 발화
 
 ## 핵심 컴포넌트
 
-### `Session` (인터페이스)
+### `Session` (추상 클래스)
 
-모든 세션 타입의 공통 계약. 라이프사이클 제어(`start`, `terminate`)와 플레이어 접근을 정의합니다.
+모든 세션 타입의 기반 클래스. `Player`와 `SessionManager` 참조를 보유하고 `active` 상태를 관리합니다.
+서브클래스에서 `onStart()`와 `onTerminate()` 훅을 구현합니다.
+
+세션 클래스 내부에서 `terminate()`를 호출하면 소유 `SessionManager`를 통해 스스로를 종료할 수 있습니다.
+
+### `SequenceSession` (추상 클래스)
+
+`SessionSequence`에서 사용하기 위해 `Session`을 상속한 클래스. 시퀀스를 다음 단계로 진행시키는 `next()`를 추가합니다.
+`LifecycleSession`을 함께 구현해선 안 됩니다.
+
+**주요 메서드:**
+
+- `protected function next(string $reason)` — 이 세션을 종료하고 시퀀스의 다음 단계를 시작합니다.
+  마지막 단계인 경우 `onComplete` 콜백이 대신 호출됩니다.
 
 ### `LifecycleSession` (인터페이스)
 
 마커 인터페이스. 이 인터페이스를 구현한 클래스는 `PlayerJoinEvent` 시 자동 생성되고 `PlayerQuitEvent` 시 자동 소멸됩니다.
+`SequenceSession`과 함께 사용할 수 없습니다.
 
-### `AbstractSession` (추상 클래스)
+### `SessionSequence` (클래스)
 
-모든 세션 타입의 기본 구현. `Player`와 `SessionManager` 참조를 보유하고 `active` 상태를 관리합니다. 서브클래스에서 `onStart()`와 `onTerminate()` 훅을
-오버라이드합니다.
+플레이어를 위한 `SequenceSession` 서브클래스의 순차적 진행을 관리합니다.
+내부적으로 각 단계마다 `SequenceSessionManager`를 생성하고 체인으로 연결합니다.
+
+`SessionSequence`에 전달하는 세션 클래스는 반드시 `SequenceSession`을 상속해야 하고 `LifecycleSession`을 구현해선 안 됩니다 — 생성 시점에 검증합니다.
 
 **주요 메서드:**
 
-- `protected function close(string $reason)` — `$this->manager->removeSession($this, $reason)`을 호출하는 편의 메서드. 세션 클래스 내부에서
-  스스로를 종료할 때 사용합니다.
+- `start(Player $player)` — 첫 번째 단계부터 시퀀스를 시작합니다.
+- `startFrom(Player $player, int|string $step)` — 0부터 시작하는 인덱스 또는 클래스명으로 특정 단계부터 시작합니다.
+- `onComplete(Closure $callback)` — 마지막 세션이 `next()`를 호출했을 때 실행할 콜백을 등록합니다.
+- `terminateAll(string $reason)` — 모든 단계의 활성 세션을 종료합니다.
 
 ### `SessionManager<T>` (클래스)
 
@@ -168,22 +201,23 @@ PMMP 이벤트 발화
 
 ### `#[SessionEventHandler]` (어트리뷰트)
 
-메서드를 세션 범위 이벤트 핸들러로 선언합니다. 같은 메서드에 여러 이벤트에 대해 중복 적용 가능합니다. 메서드는 `public`이어야 하고 null 불허 `Event` 서브클래스 파라미터를 정확히 하나 받아야
-합니다.
+메서드를 세션 범위 이벤트 핸들러로 선언합니다. 같은 메서드에 여러 이벤트에 대해 중복 적용 가능합니다.
+메서드는 `public`이어야 하고 null 불허 `Event` 서브클래스 파라미터를 정확히 하나 받아야 합니다.
 
 ### `SessionEventListenerRegistry` (싱글톤)
 
-`(eventClass, priority, handleCancelled)` 조합 — **eventKey** — 당 PMMP 리스너가 하나만 존재하도록 보장합니다. 같은 이벤트를 구독하는 여러 세션 타입이 하나의
-PMMP 리스너를 공유합니다.
+`(eventClass, priority, handleCancelled)` 조합 — **eventKey** — 당 PMMP 리스너가 하나만 존재하도록 보장합니다.
+같은 이벤트를 구독하는 여러 세션 타입이 하나의 PMMP 리스너를 공유합니다.
 
 ### `SessionEventListener` (클래스)
 
-하나의 eventKey에 대응하는 실제 PMMP 등록 리스너. `SessionEventDispatcher` 목록을 들고 발화된 이벤트를 해당 플레이어의 세션으로 라우팅합니다. 디스패치 도중 취소 상태를 반영합니다.
+하나의 eventKey에 대응하는 실제 PMMP 등록 리스너. `SessionEventDispatcher` 목록을 들고 발화된 이벤트를 해당 플레이어의 세션으로 라우팅합니다.
+디스패치 도중 취소 상태를 반영합니다.
 
 ### `SessionEventDispatcher` (클래스)
 
-`#[SessionEventHandler]` 바인딩 하나를 표현합니다. 이벤트 설정(`eventKey`), 대상 `SessionManager`, 호출할 메서드 이름을 보유합니다. 이벤트 발화 시
-`SessionEventListener`에 의해 호출됩니다.
+`#[SessionEventHandler]` 바인딩 하나를 표현합니다. 이벤트 설정(`eventKey`), 대상 `SessionManager`, 호출할 메서드 이름을 보유합니다.
+이벤트 발화 시 `SessionEventListener`에 의해 호출됩니다.
 
 ### `SessionTerminateReasons` (인터페이스)
 
@@ -196,9 +230,11 @@ PMMP 리스너를 공유합니다.
 ```
 src/kim/present/utils/session/
 ├── Session.php
-├── AbstractSession.php
+├── SequenceSession.php
 ├── LifecycleSession.php
 ├── SessionManager.php
+├── SequenceSessionManager.php
+├── SessionSequence.php
 ├── SessionTerminateReasons.php
 └── listener/
     ├── SessionEventDispatcher.php
@@ -212,19 +248,20 @@ src/kim/present/utils/session/
 
 ## 사용법
 
-### 1. 세션 정의
+### 1. 라이프사이클 세션 정의
 
-`AbstractSession`을 상속하고 자동 접속/퇴장 관리를 원하면 `LifecycleSession`을 함께 구현합니다.
+`Session`을 상속하고 자동 접속/퇴장 관리를 원하면 `LifecycleSession`을 함께 구현합니다.
 이벤트 핸들러는 `#[SessionEventHandler]`로 선언합니다 — 별도 리스너 클래스 불필요.
 
 ```php
 use pocketmine\event\block\BlockBreakEvent;
 use pocketmine\event\player\PlayerInteractEvent;
-use kim\present\utils\session\AbstractSession;
+use kim\present\utils\session\Session;
 use kim\present\utils\session\LifecycleSession;
+use kim\present\utils\session\SessionTerminateReasons;
 use kim\present\utils\session\listener\attribute\SessionEventHandler;
 
-final class WorldEditSession extends AbstractSession implements LifecycleSession{
+final class WorldEditSession extends Session implements LifecycleSession{
 
     private ?array $pos1 = null;
     private ?array $pos2 = null;
@@ -239,21 +276,20 @@ final class WorldEditSession extends AbstractSession implements LifecycleSession
 
     #[SessionEventHandler(BlockBreakEvent::class)]
     public function onBlockBreak(BlockBreakEvent $event) : void{
-        // 이 세션의 플레이어 이벤트만 전달받음
         $pos = $event->getBlock()->getPosition();
         $this->pos1 = [$pos->x, $pos->y, $pos->z];
         $event->cancel();
-
-        // $this->close()로 세션 스스로 종료
-        if($this->pos1 !== null && $this->pos2 !== null){
-            $this->close(SessionTerminateReasons::COMPLETED);
-        }
     }
 
     #[SessionEventHandler(PlayerInteractEvent::class)]
     public function onInteract(PlayerInteractEvent $event) : void{
         $pos = $event->getBlock()->getPosition();
         $this->pos2 = [$pos->x, $pos->y, $pos->z];
+
+        if($this->pos1 !== null){
+            // 두 좌표가 모두 선택되면 스스로 종료
+            $this->terminate(SessionTerminateReasons::COMPLETED);
+        }
     }
 }
 ```
@@ -263,6 +299,7 @@ final class WorldEditSession extends AbstractSession implements LifecycleSession
 ```php
 use pocketmine\plugin\PluginBase;
 use kim\present\utils\session\SessionManager;
+use kim\present\utils\session\SessionTerminateReasons;
 
 final class MyPlugin extends PluginBase{
     private SessionManager $sessionManager;
@@ -295,12 +332,95 @@ $count = $this->sessionManager->terminateAll(SessionTerminateReasons::PLUGIN_DIS
 
 ### 라이프사이클 세션 vs. 태스크 세션
 
-|       | 라이프사이클 세션              | 태스크 세션                 |
-|-------|------------------------|------------------------|
-| 인터페이스 | `LifecycleSession`     | (없음)                   |
-| 생성    | `PlayerJoinEvent` 시 자동 | `createSession()`으로 수동 |
-| 소멸    | `PlayerQuitEvent` 시 자동 | `removeSession()`으로 수동 |
-| 용도    | 플레이어별 지속 상태            | 온디맨드 기능 세션             |
+|       | 라이프사이클 세션              | 태스크 세션                    |
+|-------|------------------------|---------------------------|
+| 인터페이스 | `LifecycleSession`     | (없음)                      |
+| 생성    | `PlayerJoinEvent` 시 자동 | `createSession()`으로 수동    |
+| 소멸    | `PlayerQuitEvent` 시 자동 | `removeSession()`으로 수동    |
+| 용도    | 플레이어별 지속 상태            | 온디맨드 기능 세션                |
+
+---
+
+### 4. 시퀀스 세션 정의
+
+튜토리얼 등 다단계 흐름에는 `SequenceSession`을 상속하고 `next()`로 다음 단계로 진행합니다.
+
+```php
+use pocketmine\event\block\BlockBreakEvent;
+use pocketmine\event\block\BlockPlaceEvent;
+use kim\present\utils\session\SequenceSession;
+use kim\present\utils\session\listener\attribute\SessionEventHandler;
+
+final class TutorialStep1Session extends SequenceSession{
+
+    protected function onStart() : void{
+        $this->getPlayer()->sendMessage("1단계: 블록을 부수세요.");
+    }
+
+    protected function onTerminate(string $reason) : void{}
+
+    #[SessionEventHandler(BlockBreakEvent::class)]
+    public function onBlockBreak(BlockBreakEvent $event) : void{
+        $this->getPlayer()->sendMessage("1단계 완료!");
+        $this->next(); // TutorialStep2Session으로 진행
+    }
+}
+
+final class TutorialStep2Session extends SequenceSession{
+
+    protected function onStart() : void{
+        $this->getPlayer()->sendMessage("2단계: 블록을 설치하세요.");
+    }
+
+    protected function onTerminate(string $reason) : void{}
+
+    #[SessionEventHandler(BlockPlaceEvent::class)]
+    public function onBlockPlace(BlockPlaceEvent $event) : void{
+        $this->getPlayer()->sendMessage("2단계 완료!");
+        $this->next(); // 다음 단계 없음 — onComplete 콜백 호출
+    }
+}
+```
+
+### 5. 시퀀스 부트스트랩
+
+```php
+use pocketmine\plugin\PluginBase;
+use pocketmine\player\Player;
+use kim\present\utils\session\SessionSequence;
+use kim\present\utils\session\SessionTerminateReasons;
+
+final class MyPlugin extends PluginBase{
+    private SessionSequence $tutorialSequence;
+
+    protected function onEnable() : void{
+        $this->tutorialSequence = new SessionSequence($this,
+            TutorialStep1Session::class,
+            TutorialStep2Session::class,
+        );
+
+        $this->tutorialSequence->onComplete(function(Player $player) : void{
+            $player->sendMessage("튜토리얼 완료!");
+            $this->saveProgress($player, completed: true);
+        });
+    }
+
+    protected function onDisable() : void{
+        $this->tutorialSequence->terminateAll(SessionTerminateReasons::PLUGIN_DISABLE);
+    }
+
+    public function startTutorial(Player $player) : void{
+        $progress = $this->loadProgress($player); // 예: 0, 1
+
+        if($progress === 0){
+            $this->tutorialSequence->start($player);
+        }else{
+            // 저장된 단계부터 재개 (인덱스 또는 클래스명으로 지정)
+            $this->tutorialSequence->startFrom($player, $progress);
+        }
+    }
+}
+```
 
 ---
 
@@ -308,17 +428,17 @@ $count = $this->sessionManager->terminateAll(SessionTerminateReasons::PLUGIN_DIS
 
 `terminate(string $reason)`은 임의의 문자열을 허용합니다. `SessionTerminateReasons`로 내장 상수를 제공합니다:
 
-| 상수               | 값                  | 설명                  |
-|------------------|--------------------|---------------------|
-| `MANUAL`         | `"manual"`         | 플러그인 코드에서 명시적으로 종료  |
-| `PLAYER_QUIT`    | `"player_quit"`    | 플레이어 접속 종료          |
-| `PLUGIN_DISABLE` | `"plugin_disable"` | 소유 플러그인 비활성화        |
-| `START_FAILED`   | `"start_failed"`   | 초기화 실패로 활성화 전 종료    |
-| `COMPLETED`      | `"completed"`      | 세션이 정상적으로 종료 상태에 도달 |
-| `CANCELLED`      | `"cancelled"`      | 종료 상태 도달 전 중단       |
-| `TIMEOUT`        | `"timeout"`        | 허용 시간 초과로 강제 종료     |
-| `RESTART`        | `"restart"`        | 재시작을 위해 종료          |
-| `MAINTENANCE`    | `"maintenance"`    | 서버 점검으로 인한 종료       |
+| 상수               | 값                  | 설명                    |
+|------------------|--------------------|------------------------|
+| `MANUAL`         | `"manual"`         | 플러그인 코드에서 명시적으로 종료    |
+| `PLAYER_QUIT`    | `"player_quit"`    | 플레이어 접속 종료            |
+| `PLUGIN_DISABLE` | `"plugin_disable"` | 소유 플러그인 비활성화          |
+| `START_FAILED`   | `"start_failed"`   | 초기화 실패로 활성화 전 종료      |
+| `COMPLETED`      | `"completed"`      | 세션이 정상적으로 종료 상태에 도달   |
+| `CANCELLED`      | `"cancelled"`      | 종료 상태 도달 전 중단         |
+| `TIMEOUT`        | `"timeout"`        | 허용 시간 초과로 강제 종료       |
+| `RESTART`        | `"restart"`        | 재시작을 위해 종료            |
+| `MAINTENANCE`    | `"maintenance"`    | 서버 점검으로 인한 종료         |
 
 ---
 
@@ -335,13 +455,8 @@ $count = $this->sessionManager->terminateAll(SessionTerminateReasons::PLUGIN_DIS
 ---
 
 [poggit-ci-badge]: https://poggit.pmmp.io/ci.shield/presentkim-pm/session-utils/session-utils?style=for-the-badge
-
 [stars-badge]: https://img.shields.io/github/stars/presentkim-pm/session-utils.svg?style=for-the-badge
-
 [license-badge]: https://img.shields.io/github/license/presentkim-pm/session-utils.svg?style=for-the-badge
-
 [stars-url]: https://github.com/presentkim-pm/session-utils/stargazers
-
 [issues-url]: https://github.com/presentkim-pm/session-utils/issues
-
 [license-url]: https://github.com/presentkim-pm/session-utils/blob/main/LICENSE

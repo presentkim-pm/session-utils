@@ -30,8 +30,8 @@ handles the rest.
 **What it does:**
 
 - Automatically creates and destroys sessions on player join/quit (for lifecycle sessions)
-- Routes PMMP events to the correct player's session using `#[SessionEventHandler]` attributes — no listener classes to
-  write
+- Routes PMMP events to the correct player's session using `#[SessionEventHandler]` attributes — no listener classes to write
+- Supports ordered session progression via `SessionSequence` for multi-step flows like tutorials
 - Prevents duplicate PMMP listener registration across multiple session types via a global registry
 - Provides a generic, type-safe `SessionManager<T>` for clean plugin architecture
 
@@ -51,24 +51,21 @@ classDiagram
 direction LR
 
 class Session {
-    <<interface>>
-    +getPlayer() Player
-    +isActive() bool
-    +start() void
-    +terminate(reason) void
-}
-
-class AbstractSession {
+    <<abstract>>
     -Player player
-    -SessionManager manager
+    -SessionManager sessionManager
     -bool active
     +getPlayer() Player
     +isActive() bool
     +start() void
     +terminate(reason) void
-    #close(reason) void
     #onStart() void
     #onTerminate(reason) void
+}
+
+class SequenceSession {
+    <<abstract>>
+    #next(reason) void
 }
 
 class LifecycleSession {
@@ -83,6 +80,20 @@ class SessionManager~T extends Session~ {
     +getAllSessions() list~T~
     +removeSession(session, reason) void
     +terminateAll(reason) int
+    +getSessionClass() class-string
+}
+
+class SequenceSessionManager {
+    +setNext(manager) void
+    +setOnExhausted(callback) void
+    +progressNext(player, reason) void
+}
+
+class SessionSequence {
+    +start(player) void
+    +startFrom(player, step) void
+    +onComplete(callback) self
+    +terminateAll(reason) void
 }
 
 class SessionEventListenerRegistry {
@@ -118,8 +129,11 @@ class SessionEventHandler {
     +bool handleCancelled
 }
 
-Session <|.. AbstractSession
-AbstractSession <|-- LifecycleSession
+Session <|-- SequenceSession
+Session <|-- LifecycleSession
+SessionManager <|-- SequenceSessionManager
+SessionSequence --> SequenceSessionManager : creates and chains
+SequenceSessionManager --> SequenceSession : manages
 SessionManager --> Session : manages
 SessionManager --> SessionEventListenerRegistry : registers via
 SessionEventListenerRegistry --> SessionEventListener : owns one per eventKey
@@ -142,29 +156,46 @@ PMMP fires event
 
 ## Core Components
 
-### `Session` (interface)
+### `Session` (abstract class)
 
-Contract for all session types. Defines lifecycle control (`start`, `terminate`) and player access.
+Base class for all session types. Holds the `Player` and `SessionManager` references and manages `active` state.
+Exposes `onStart()` and `onTerminate()` hooks for subclasses to implement.
+
+Calling `terminate()` inside a session class will self-terminate the session via the owning `SessionManager`.
+
+### `SequenceSession` (abstract class)
+
+Extends `Session` for use within a `SessionSequence`. Adds `next()` to advance the sequence to the next step.
+Must not implement `LifecycleSession`.
+
+**Key methods:**
+
+- `protected function next(string $reason)` — Terminates this session and starts the next step in the sequence.
+  If this is the last step, the sequence's `onComplete` callback is invoked instead.
 
 ### `LifecycleSession` (interface)
 
 Marker interface. Classes implementing this are automatically created on `PlayerJoinEvent` and destroyed on
-`PlayerQuitEvent` by `SessionManager`.
+`PlayerQuitEvent` by `SessionManager`. Must not be combined with `SequenceSession`.
 
-### `AbstractSession` (abstract class)
+### `SessionSequence` (class)
 
-Base implementation for all session types. Holds the `Player` and `SessionManager` references, manages `active` state.
-Exposes `onStart()` and `onTerminate()` hooks for subclasses.
+Manages an ordered progression of `SequenceSession` subclasses for a single player.
+Internally creates and chains a `SequenceSessionManager` per step.
+
+All session classes passed to `SessionSequence` must extend `SequenceSession` and must not implement `LifecycleSession`
+— this is enforced at construction time.
 
 **Key methods:**
 
-- `protected function close(string $reason)` — Convenience method that calls
-  `$this->manager->removeSession($this, $reason)`. Use this inside session classes to terminate themselves with a single
-  call.
+- `start(Player $player)` — Starts the sequence from the first step.
+- `startFrom(Player $player, int|string $step)` — Starts from a specific step by 0-based index or class-string.
+- `onComplete(Closure $callback)` — Registers a callback invoked when the last session calls `next()`.
+- `terminateAll(string $reason)` — Terminates all active sessions across all steps.
 
 ### `SessionManager<T>` (class)
 
-Central orchestrator for one session type. On construction :
+Central orchestrator for one session type. On construction:
 
 1. Scans the session class for `#[SessionEventHandler]` attributes
 2. Registers the resulting dispatchers with `SessionEventListenerRegistry`
@@ -177,13 +208,13 @@ events. The method must be `public` and accept exactly one non-nullable `Event` 
 
 ### `SessionEventListenerRegistry` (singleton)
 
-Ensures only one PMMP listener exists per unique `(eventClass, priority, handleCancelled)` combination — the **eventKey
-**. Multiple session types subscribing to the same event share a single PMMP listener.
+Ensures only one PMMP listener exists per unique `(eventClass, priority, handleCancelled)` combination — the **eventKey**.
+Multiple session types subscribing to the same event share a single PMMP listener.
 
 ### `SessionEventListener` (class)
 
-The actual PMMP-registered listener for one eventKey. Holds a list of `SessionEventDispatcher` instances and routes each
-fired event to the correct player's session. Respects cancellation state mid-dispatch.
+The actual PMMP-registered listener for one eventKey. Holds a list of `SessionEventDispatcher` instances and routes
+each fired event to the correct player's session. Respects cancellation state mid-dispatch.
 
 ### `SessionEventDispatcher` (class)
 
@@ -202,9 +233,11 @@ consistent across plugins.
 ```
 src/kim/present/utils/session/
 ├── Session.php
-├── AbstractSession.php
+├── SequenceSession.php
 ├── LifecycleSession.php
 ├── SessionManager.php
+├── SequenceSessionManager.php
+├── SessionSequence.php
 ├── SessionTerminateReasons.php
 └── listener/
     ├── SessionEventDispatcher.php
@@ -218,19 +251,20 @@ src/kim/present/utils/session/
 
 ## Usage
 
-### 1. Define a session
+### 1. Define a lifecycle session
 
-Extend `AbstractSession` and implement `LifecycleSession` for automatic join/quit management.
+Extend `Session` and implement `LifecycleSession` for automatic join/quit management.
 Declare event handlers with `#[SessionEventHandler]` — no separate listener class needed.
 
 ```php
 use pocketmine\event\block\BlockBreakEvent;
 use pocketmine\event\player\PlayerInteractEvent;
-use kim\present\utils\session\AbstractSession;
+use kim\present\utils\session\Session;
 use kim\present\utils\session\LifecycleSession;
+use kim\present\utils\session\SessionTerminateReasons;
 use kim\present\utils\session\listener\attribute\SessionEventHandler;
 
-final class WorldEditSession extends AbstractSession implements LifecycleSession{
+final class WorldEditSession extends Session implements LifecycleSession{
 
     private ?array $pos1 = null;
     private ?array $pos2 = null;
@@ -245,21 +279,20 @@ final class WorldEditSession extends AbstractSession implements LifecycleSession
 
     #[SessionEventHandler(BlockBreakEvent::class)]
     public function onBlockBreak(BlockBreakEvent $event) : void{
-        // Only called for this session's player
         $pos = $event->getBlock()->getPosition();
         $this->pos1 = [$pos->x, $pos->y, $pos->z];
         $event->cancel();
-
-        // Use $this->close() to terminate this session
-        if($this->pos1 !== null && $this->pos2 !== null){
-            $this->close(SessionTerminateReasons::COMPLETED);
-        }
     }
 
     #[SessionEventHandler(PlayerInteractEvent::class)]
     public function onInteract(PlayerInteractEvent $event) : void{
         $pos = $event->getBlock()->getPosition();
         $this->pos2 = [$pos->x, $pos->y, $pos->z];
+
+        if($this->pos1 !== null){
+            // Self-terminate when both positions are selected
+            $this->terminate(SessionTerminateReasons::COMPLETED);
+        }
     }
 }
 ```
@@ -269,6 +302,7 @@ final class WorldEditSession extends AbstractSession implements LifecycleSession
 ```php
 use pocketmine\plugin\PluginBase;
 use kim\present\utils\session\SessionManager;
+use kim\present\utils\session\SessionTerminateReasons;
 
 final class MyPlugin extends PluginBase{
     private SessionManager $sessionManager;
@@ -301,12 +335,95 @@ $count = $this->sessionManager->terminateAll(SessionTerminateReasons::PLUGIN_DIS
 
 ### Lifecycle sessions vs. task sessions
 
-|           | Lifecycle session                  | Task session                       |
-|-----------|------------------------------------|------------------------------------|
-| Interface | `LifecycleSession`                 | (none)                             |
-| Created   | Automatically on `PlayerJoinEvent` | Manually via `createSession()`     |
-| Destroyed | Automatically on `PlayerQuitEvent` | Automatically on `PlayerQuitEvent` |
-| Use case  | Per-player persistent state        | On-demand feature sessions         |
+|           | Lifecycle session                  | Task session                   |
+|-----------|------------------------------------|--------------------------------|
+| Interface | `LifecycleSession`                 | (none)                         |
+| Created   | Automatically on `PlayerJoinEvent` | Manually via `createSession()` |
+| Destroyed | Automatically on `PlayerQuitEvent` | Manually via `removeSession()` |
+| Use case  | Per-player persistent state        | On-demand feature sessions     |
+
+---
+
+### 4. Define a sequence session
+
+For multi-step flows (e.g. tutorials), extend `SequenceSession` and call `next()` to advance to the next step.
+
+```php
+use pocketmine\event\block\BlockBreakEvent;
+use pocketmine\event\block\BlockPlaceEvent;
+use kim\present\utils\session\SequenceSession;
+use kim\present\utils\session\listener\attribute\SessionEventHandler;
+
+final class TutorialStep1Session extends SequenceSession{
+
+    protected function onStart() : void{
+        $this->getPlayer()->sendMessage("Step 1: Break a block.");
+    }
+
+    protected function onTerminate(string $reason) : void{}
+
+    #[SessionEventHandler(BlockBreakEvent::class)]
+    public function onBlockBreak(BlockBreakEvent $event) : void{
+        $this->getPlayer()->sendMessage("Step 1 complete!");
+        $this->next(); // Advances to TutorialStep2Session
+    }
+}
+
+final class TutorialStep2Session extends SequenceSession{
+
+    protected function onStart() : void{
+        $this->getPlayer()->sendMessage("Step 2: Place a block.");
+    }
+
+    protected function onTerminate(string $reason) : void{}
+
+    #[SessionEventHandler(BlockPlaceEvent::class)]
+    public function onBlockPlace(BlockPlaceEvent $event) : void{
+        $this->getPlayer()->sendMessage("Step 2 complete!");
+        $this->next(); // No next step — triggers onComplete callback
+    }
+}
+```
+
+### 5. Bootstrap a sequence
+
+```php
+use pocketmine\plugin\PluginBase;
+use pocketmine\player\Player;
+use kim\present\utils\session\SessionSequence;
+use kim\present\utils\session\SessionTerminateReasons;
+
+final class MyPlugin extends PluginBase{
+    private SessionSequence $tutorialSequence;
+
+    protected function onEnable() : void{
+        $this->tutorialSequence = new SessionSequence($this,
+            TutorialStep1Session::class,
+            TutorialStep2Session::class,
+        );
+
+        $this->tutorialSequence->onComplete(function(Player $player) : void{
+            $player->sendMessage("Tutorial complete!");
+            $this->saveProgress($player, completed: true);
+        });
+    }
+
+    protected function onDisable() : void{
+        $this->tutorialSequence->terminateAll(SessionTerminateReasons::PLUGIN_DISABLE);
+    }
+
+    public function startTutorial(Player $player) : void{
+        $progress = $this->loadProgress($player); // e.g. 0, 1
+
+        if($progress === 0){
+            $this->tutorialSequence->start($player);
+        }else{
+            // Resume from where the player left off (by index or class-string)
+            $this->tutorialSequence->startFrom($player, $progress);
+        }
+    }
+}
+```
 
 ---
 
@@ -319,6 +436,7 @@ $count = $this->sessionManager->terminateAll(SessionTerminateReasons::PLUGIN_DIS
 | `MANUAL`         | `"manual"`         | Explicitly terminated by plugin code |
 | `PLAYER_QUIT`    | `"player_quit"`    | Player disconnected                  |
 | `PLUGIN_DISABLE` | `"plugin_disable"` | Owning plugin was disabled           |
+| `START_FAILED`   | `"start_failed"`   | Session failed to initialize         |
 | `COMPLETED`      | `"completed"`      | Session reached its end state        |
 | `CANCELLED`      | `"cancelled"`      | Session abandoned before completion  |
 | `TIMEOUT`        | `"timeout"`        | Session exceeded allotted time       |
@@ -340,13 +458,8 @@ Distributed under the **MIT License**. See [LICENSE][license-url] for more infor
 ---
 
 [poggit-ci-badge]: https://poggit.pmmp.io/ci.shield/presentkim-pm/session-utils/session-utils?style=for-the-badge
-
 [stars-badge]: https://img.shields.io/github/stars/presentkim-pm/session-utils.svg?style=for-the-badge
-
 [license-badge]: https://img.shields.io/github/license/presentkim-pm/session-utils.svg?style=for-the-badge
-
 [stars-url]: https://github.com/presentkim-pm/session-utils/stargazers
-
 [issues-url]: https://github.com/presentkim-pm/session-utils/issues
-
 [license-url]: https://github.com/presentkim-pm/session-utils/blob/main/LICENSE
