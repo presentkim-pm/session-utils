@@ -28,6 +28,7 @@ namespace kim\present\utils\session;
 
 use kim\present\utils\session\listener\attribute\SessionEventHandler;
 use kim\present\utils\session\listener\dispatcher\BaseSessionEventDispatcher;
+use kim\present\utils\session\listener\dispatcher\ManagerMethodDispatcher;
 use kim\present\utils\session\listener\dispatcher\SessionMethodDispatcher;
 use kim\present\utils\session\listener\SessionEventListenerRegistry;
 use pocketmine\event\Event;
@@ -36,7 +37,6 @@ use pocketmine\event\player\PlayerJoinEvent;
 use pocketmine\event\player\PlayerQuitEvent;
 use pocketmine\player\Player;
 use pocketmine\plugin\PluginBase;
-use pocketmine\Server;
 use pocketmine\utils\Utils;
 use ReflectionClass;
 use ReflectionMethod;
@@ -113,9 +113,9 @@ class SessionManager{
     ){
         $this->plugin = $plugin;
         $this->sessionClass = $sessionClass;
-        $this->collectBindings();
-        $this->registerBindings();
-        $this->registerJoinQuitListeners();
+        $this->collectSessionLifecycleBindings();
+        $this->collectSessionEventBindings();
+        $this->registerEventBindings();
     }
 
     /**
@@ -296,6 +296,16 @@ class SessionManager{
         return $this;
     }
 
+    /** @internal Called by ManagerMethodDispatcher. */
+    public function onPlayerJoin(PlayerJoinEvent $event) : void{
+        $this->createSession($event->getPlayer());
+    }
+
+    /** @internal Called by ManagerMethodDispatcher. */
+    public function onPlayerQuit(PlayerQuitEvent $event) : void{
+        $this->removeSession($event->getPlayer(), SessionTerminateReasons::PLAYER_QUIT);
+    }
+
     /**
      * Instantiates a new session of the managed class.
      *
@@ -311,49 +321,51 @@ class SessionManager{
     }
 
     /**
-     * Registers PlayerJoin and PlayerQuit listeners for automatic session lifecycle.
+     * Collects lifecycle dispatchers for PlayerJoin and PlayerQuit events
+     * and appends them to {@link $eventBindingList}.
      *
-     * PlayerJoin registration is skipped if the session class does not implement
-     * {@link LifecycleSession}, as those sessions are created manually.
+     * PlayerJoin dispatcher registration is skipped if the session class
+     * does not implement {@link LifecycleSession}, as those sessions are
+     * created manually via {@link createSession()}.
      *
-     * @noinspection PhpUnhandledExceptionInspection
+     * The collected dispatchers are registered with {@link SessionEventListenerRegistry}
+     * in {@link registerEventBindings()}.
      */
-    private function registerJoinQuitListeners() : void{
-        $pluginManager = Server::getInstance()->getPluginManager();
-
+    private function collectSessionLifecycleBindings() : void{
         if(is_a($this->sessionClass, LifecycleSession::class, true)){
-            $pluginManager->registerEvent(
-                PlayerJoinEvent::class,
-                fn(PlayerJoinEvent $event) => $this->createSession($event->getPlayer()),
-                EventPriority::HIGHEST,
-                $this->plugin
+            $this->eventBindingList[] = new ManagerMethodDispatcher(
+                sessionManager: $this,
+                eventClass: PlayerJoinEvent::class,
+                priority: EventPriority::HIGHEST,
+                handleCancelled: false,
+                methodName: "onPlayerJoin",/** @see self::onPlayerJoin() */
             );
         }
 
-        $pluginManager->registerEvent(
-            PlayerQuitEvent::class,
-            function(PlayerQuitEvent $event) : void{
-                $session = $this->sessions[$event->getPlayer()->getId()] ?? null;
-                if($session !== null){
-                    $this->removeSession($session, SessionTerminateReasons::PLAYER_QUIT);
-                }
-            },
-            EventPriority::HIGHEST,
-            $this->plugin
+        $this->eventBindingList[] = new ManagerMethodDispatcher(
+            sessionManager: $this,
+            eventClass: PlayerQuitEvent::class,
+            priority: EventPriority::HIGHEST,
+            handleCancelled: false,
+            methodName: "onPlayerQuit",/** @see self::onPlayerQuit() */
         );
     }
 
     /**
      * Scans the session class for {@link SessionEventHandler} attributes and
-     * populates {@link $eventBindingList}.
+     * appends the resulting dispatchers to {@link $eventBindingList}.
      *
-     * Invalid event classes or handler signatures are logged as warnings and skipped.
+     * Each public method annotated with {@link SessionEventHandler} is validated
+     * for a correct handler signature (exactly one non-nullable {@link Event}
+     * subclass parameter). Invalid event classes or signatures are logged as
+     * warnings and skipped.
+     *
+     * The collected dispatchers are registered with {@link SessionEventListenerRegistry}
+     * in {@link registerEventBindings()}.
      *
      * @noinspection PhpUnhandledExceptionInspection
      */
-    private function collectBindings() : void{
-        $this->eventBindingList = [];
-
+    private function collectSessionEventBindings() : void{
         $reflection = new ReflectionClass($this->sessionClass);
         foreach($reflection->getMethods(ReflectionMethod::IS_PUBLIC) as $method){
             foreach($method->getAttributes(SessionEventHandler::class) as $attribute){
@@ -389,9 +401,10 @@ class SessionManager{
     /**
      * Registers all collected dispatchers with {@link SessionEventListenerRegistry}.
      *
-     * Called once after {@link collectBindings()} during construction.
+     * Called once after {@link collectSessionLifecycleBindings()} and
+     * {@link collectSessionEventBindings()} during construction.
      */
-    private function registerBindings() : void{
+    private function registerEventBindings() : void{
         $registry = SessionEventListenerRegistry::getInstance();
         foreach($this->eventBindingList as $binding){
             $registry->attachBinding($binding, $this->plugin);
