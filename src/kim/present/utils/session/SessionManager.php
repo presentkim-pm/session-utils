@@ -176,7 +176,12 @@ class SessionManager{
             }else{
                 return;
             }
+        }elseif(!isset($this->sessions[$session->getPlayer()->getId()])){
+            return;
         }
+
+        // Unregister from sessions map first to prevent re-entry from terminate().
+        unset($this->sessions[$session->getPlayer()->getId()]);
 
         try{
             if($session->isActive()){
@@ -187,8 +192,6 @@ class SessionManager{
                 "Session terminate() failed [$session::class]: " . $e->getMessage()
             );
         }
-
-        unset($this->sessions[$session->getPlayer()->getId()]);
     }
 
     /**
