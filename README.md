@@ -460,6 +460,7 @@ Distributed under the **MIT License**. See [LICENSE][license-url] for more infor
 [poggit-ci-badge]: https://poggit.pmmp.io/ci.shield/presentkim-pm/session-utils/session-utils?style=for-the-badge
 [stars-badge]: https://img.shields.io/github/stars/presentkim-pm/session-utils.svg?style=for-the-badge
 [license-badge]: https://img.shields.io/github/license/presentkim-pm/session-utils.svg?style=for-the-badge
+[poggit-ci-url]: https://poggit.pmmp.io/ci/presentkim-pm/session-utils/session-utils
 [stars-url]: https://github.com/presentkim-pm/session-utils/stargazers
 [issues-url]: https://github.com/presentkim-pm/session-utils/issues
 [license-url]: https://github.com/presentkim-pm/session-utils/blob/main/LICENSE
