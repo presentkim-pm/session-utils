@@ -157,6 +157,38 @@ class SessionManager{
     }
 
     /**
+     * Retrieves the active session for a player, throwing if none exists.
+     *
+     * @param Player|int $playerOrId The player or their runtime ID.
+     *
+     * @return TSession
+     *
+     * @throws \RuntimeException If no session exists for the given player.
+     */
+    public function getSessionOrThrow(Player|int $playerOrId) : Session{
+        $session = $this->getSession($playerOrId);
+        if($session === null){
+            $id = $playerOrId instanceof Player ? $playerOrId->getName() : $playerOrId;
+            throw new \RuntimeException("No active session found for player '$id'.");
+        }
+        return $session;
+    }
+
+    /**
+     * Retrieves the active session for a player, creating one if none exists.
+     *
+     * If a session already exists, it is returned as-is without calling start() again.
+     * If creation fails, null is returned and the error is logged.
+     *
+     * @param Player $player The player to get or create a session for.
+     *
+     * @return TSession|null The existing or newly created session, or null on failure.
+     */
+    public function getOrCreateSession(Player $player) : ?Session{
+        return $this->getSession($player) ?? $this->createSession($player);
+    }
+
+    /**
      * Returns all active sessions.
      *
      * @return Session[]
