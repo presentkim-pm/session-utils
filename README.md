@@ -30,7 +30,8 @@ handles the rest.
 **What it does:**
 
 - Automatically creates and destroys sessions on player join/quit (for lifecycle sessions)
-- Routes PMMP events to the correct player's session using `#[SessionEventHandler]` attributes — no listener classes to write
+- Routes PMMP events to the correct player's session using `#[SessionEventHandler]` attributes — no listener classes to
+  write
 - Supports ordered session progression via `SessionSequence` for multi-step flows like tutorials
 - Prevents duplicate PMMP listener registration across multiple session types via a global registry
 - Provides a generic, type-safe `SessionManager<T>` for clean plugin architecture
@@ -76,11 +77,15 @@ class SessionManager~T extends Session~ {
     -array sessions
     -list eventBindingList
     +getSession(playerOrId) T?
+    +getSessionOrThrow(playerOrId) T
+    +getOrCreateSession(player) T?
     +createSession(player, ...args) T?
     +getAllSessions() list~T~
     +removeSession(session, reason) void
     +terminateAll(reason) int
     +getSessionClass() class-string
+    +onSessionCreated(callback) self
+    +onSessionTerminated(callback) self
 }
 
 class SequenceSessionManager {
@@ -112,13 +117,21 @@ class SessionEventListener {
     +hasDispatchers() bool
 }
 
-class SessionEventDispatcher {
-    +SessionManager sessionManager
+class BaseSessionEventDispatcher {
+    <<abstract>>
+    +string eventKey
     +string eventClass
     +int priority
     +bool handleCancelled
     +string methodName
-    +string eventKey
+    +dispatch(event, player) void
+}
+
+class SessionMethodDispatcher {
+    +dispatch(event, player) void
+}
+
+class ManagerMethodDispatcher {
     +dispatch(event, player) void
 }
 
@@ -137,8 +150,10 @@ SequenceSessionManager --> SequenceSession : manages
 SessionManager --> Session : manages
 SessionManager --> SessionEventListenerRegistry : registers via
 SessionEventListenerRegistry --> SessionEventListener : owns one per eventKey
-SessionEventListener --> SessionEventDispatcher : dispatches to
-SessionEventDispatcher ..> SessionEventHandler : created from
+SessionEventListener --> BaseSessionEventDispatcher : dispatches to
+BaseSessionEventDispatcher <|-- SessionMethodDispatcher
+BaseSessionEventDispatcher <|-- ManagerMethodDispatcher
+SessionMethodDispatcher ..> SessionEventHandler : created from
 ```
 
 ### Event flow
@@ -147,9 +162,9 @@ SessionEventDispatcher ..> SessionEventHandler : created from
 PMMP fires event
   → SessionEventListener::onEvent()
     → [cancelled mid-dispatch? stop if handleCancelled=false]
-    → SessionEventDispatcher::dispatch()
-      → SessionManager::getSession(player)
-        → Session::{methodName}(event)
+    → BaseSessionEventDispatcher::dispatch()
+      ├─ SessionMethodDispatcher → SessionManager::getSession(player) → Session::{methodName}(event)
+      └─ ManagerMethodDispatcher → SessionManager::{methodName}(event)
 ```
 
 ---
@@ -197,9 +212,17 @@ All session classes passed to `SessionSequence` must extend `SequenceSession` an
 
 Central orchestrator for one session type. On construction:
 
-1. Scans the session class for `#[SessionEventHandler]` attributes
-2. Registers the resulting dispatchers with `SessionEventListenerRegistry`
-3. Registers join/quit lifecycle listeners (if `LifecycleSession`)
+1. Collects lifecycle dispatchers for `PlayerJoinEvent` / `PlayerQuitEvent` (if `LifecycleSession`)
+2. Scans the session class for `#[SessionEventHandler]` attributes
+3. Registers all collected dispatchers with `SessionEventListenerRegistry`
+
+**Key methods:**
+
+- `getSession(Player|int)` — Returns the active session or null.
+- `getSessionOrThrow(Player|int)` — Returns the active session or throws if none exists.
+- `getOrCreateSession(Player)` — Returns the active session or creates one if none exists.
+- `onSessionCreated(Closure)` — Registers a callback invoked after a session is created and started.
+- `onSessionTerminated(Closure)` — Registers a callback invoked after a session is terminated and removed.
 
 ### `#[SessionEventHandler]` (attribute)
 
@@ -208,18 +231,24 @@ events. The method must be `public` and accept exactly one non-nullable `Event` 
 
 ### `SessionEventListenerRegistry` (singleton)
 
-Ensures only one PMMP listener exists per unique `(eventClass, priority, handleCancelled)` combination — the **eventKey**.
-Multiple session types subscribing to the same event share a single PMMP listener.
+Ensures only one PMMP listener exists per unique `(eventClass, priority, handleCancelled)` combination — the **eventKey
+**.
+Multiple session types subscribing to the same event share a single PMMP listener. This applies to both
+session event handlers and lifecycle events (`PlayerJoinEvent`, `PlayerQuitEvent`).
 
 ### `SessionEventListener` (class)
 
-The actual PMMP-registered listener for one eventKey. Holds a list of `SessionEventDispatcher` instances and routes
-each fired event to the correct player's session. Respects cancellation state mid-dispatch.
+The actual PMMP-registered listener for one eventKey. Holds a list of `BaseSessionEventDispatcher` instances and routes
+each fired event to them in registration order. Respects cancellation state mid-dispatch.
 
-### `SessionEventDispatcher` (class)
+### `BaseSessionEventDispatcher` (abstract class)
 
-Represents one `#[SessionEventHandler]` binding. Holds its event configuration (`eventKey`), the target
-`SessionManager`, and the method name to invoke. Called by `SessionEventListener` on each event.
+Base class for all event dispatchers. Holds the listener configuration (`eventKey`, `eventClass`, `priority`,
+`handleCancelled`, `methodName`) and defines the `dispatch()` contract. Two concrete subclasses are provided:
+
+- `SessionMethodDispatcher` — Looks up the player's active session and invokes the bound method on it.
+- `ManagerMethodDispatcher` — Invokes the bound method directly on the `SessionManager` instance. Used internally for
+  lifecycle event handling.
 
 ### `SessionTerminateReasons` (interface)
 
@@ -240,11 +269,14 @@ src/kim/present/utils/session/
 ├── SessionSequence.php
 ├── SessionTerminateReasons.php
 └── listener/
-    ├── SessionEventDispatcher.php
     ├── SessionEventListener.php
     ├── SessionEventListenerRegistry.php
-    └── attribute/
-        └── SessionEventHandler.php
+    ├── attribute/
+    │   └── SessionEventHandler.php
+    └── dispatcher/
+        ├── BaseSessionEventDispatcher.php
+        ├── SessionMethodDispatcher.php
+        └── ManagerMethodDispatcher.php
 ```
 
 ---
@@ -309,6 +341,14 @@ final class MyPlugin extends PluginBase{
 
     protected function onEnable() : void{
         $this->sessionManager = new SessionManager($this, WorldEditSession::class);
+
+        $this->sessionManager
+            ->onSessionCreated(function(WorldEditSession $session) : void{
+                // e.g. log session start
+            })
+            ->onSessionTerminated(function(WorldEditSession $session, string $reason) : void{
+                // e.g. persist state to DB
+            });
     }
 
     protected function onDisable() : void{
@@ -323,8 +363,14 @@ final class MyPlugin extends PluginBase{
 // Create a session on demand (for non-lifecycle sessions)
 $session = $this->sessionManager->createSession($player);
 
-// Retrieve a session
+// Retrieve a session (returns null if none exists)
 $session = $this->sessionManager->getSession($player);
+
+// Retrieve a session or throw if none exists
+$session = $this->sessionManager->getSessionOrThrow($player);
+
+// Retrieve a session or create one if none exists
+$session = $this->sessionManager->getOrCreateSession($player);
 
 // Remove a specific session
 $this->sessionManager->removeSession($player, SessionTerminateReasons::MANUAL);
@@ -458,9 +504,15 @@ Distributed under the **MIT License**. See [LICENSE][license-url] for more infor
 ---
 
 [poggit-ci-badge]: https://poggit.pmmp.io/ci.shield/presentkim-pm/session-utils/session-utils?style=for-the-badge
+
 [stars-badge]: https://img.shields.io/github/stars/presentkim-pm/session-utils.svg?style=for-the-badge
+
 [license-badge]: https://img.shields.io/github/license/presentkim-pm/session-utils.svg?style=for-the-badge
+
 [poggit-ci-url]: https://poggit.pmmp.io/ci/presentkim-pm/session-utils/session-utils
+
 [stars-url]: https://github.com/presentkim-pm/session-utils/stargazers
+
 [issues-url]: https://github.com/presentkim-pm/session-utils/issues
+
 [license-url]: https://github.com/presentkim-pm/session-utils/blob/main/LICENSE
