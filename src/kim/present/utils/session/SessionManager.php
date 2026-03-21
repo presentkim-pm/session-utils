@@ -36,6 +36,7 @@ use pocketmine\event\player\PlayerQuitEvent;
 use pocketmine\player\Player;
 use pocketmine\plugin\PluginBase;
 use pocketmine\Server;
+use pocketmine\utils\Utils;
 use ReflectionClass;
 use ReflectionMethod;
 use Throwable;
@@ -83,6 +84,20 @@ class SessionManager{
      * @var list<SessionEventDispatcher>
      */
     protected array $eventBindingList = [];
+
+    /**
+     * Callback invoked after a session is created and started.
+     *
+     * @var (\Closure(TSession): void)|null
+     */
+    private ?\Closure $onSessionCreated = null;
+
+    /**
+     * Callback invoked after a session is terminated and removed.
+     *
+     * @var (\Closure(TSession, string): void)|null
+     */
+    private ?\Closure $onSessionTerminated = null;
 
     /**
      * @param PluginBase                     $plugin       The plugin that owns this manager.
@@ -148,6 +163,10 @@ class SessionManager{
             $session = $this->instantiateSession($player, ...$args);
             $this->sessions[$playerId] = $session;
             $session->start();
+
+            if($this->onSessionCreated !== null){
+                ($this->onSessionCreated)($session);
+            }
             return $session;
         }catch(Throwable $e){
             unset($this->sessions[$playerId]);
@@ -233,6 +252,10 @@ class SessionManager{
                 "Session terminate() failed [$session::class]: " . $e->getMessage()
             );
         }
+
+        if($this->onSessionTerminated !== null){
+            ($this->onSessionTerminated)($session, $reason);
+        }
     }
 
     /**
@@ -248,6 +271,28 @@ class SessionManager{
             $this->removeSession($session, $reason);
         }
         return count($sessions);
+    }
+
+    /**
+     * Registers a callback invoked after a session is created and started.
+     *
+     * @param \Closure(TSession): void $callback
+     */
+    public function onSessionCreated(\Closure $callback) : self{
+        Utils::validateCallableSignature(function(Session $session){}, $callback);
+        $this->onSessionCreated = $callback;
+        return $this;
+    }
+
+    /**
+     * Registers a callback invoked after a session is terminated and removed.
+     *
+     * @param \Closure(TSession, string): void $callback
+     */
+    public function onSessionTerminated(\Closure $callback) : self{
+        Utils::validateCallableSignature(function(Session $session, string $reason){}, $callback);
+        $this->onSessionTerminated = $callback;
+        return $this;
     }
 
     /**
