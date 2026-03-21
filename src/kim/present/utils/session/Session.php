@@ -29,16 +29,47 @@ namespace kim\present\utils\session;
 use pocketmine\player\Player;
 
 /**
- * Contract for all session types managed by SessionManager.
+ * Base implementation shared by all session types.
+ *
+ * @template TManager of SessionManager
  */
-interface Session{
+abstract class Session{
+    private bool $active = false;
 
-    public function getPlayer() : Player;
+    public function __construct(
+        /** @phpstan-var TManager $sessionManager */
+        protected readonly SessionManager $sessionManager,
+        protected readonly Player $player
+    ){}
 
-    public function isActive() : bool;
+    final public function getPlayer() : Player{
+        return $this->player;
+    }
 
-    public function start() : void;
+    final public function isActive() : bool{
+        return $this->active;
+    }
 
-    public function terminate(string $reason = SessionTerminateReasons::MANUAL) : void;
+    final public function start() : void{
+        if($this->active){
+            return;
+        }
 
+        $this->active = true;
+        $this->onStart();
+    }
+
+    final public function terminate(string $reason = SessionTerminateReasons::MANUAL) : void{
+        if(!$this->active){
+            return;
+        }
+
+        $this->active = false;
+        $this->sessionManager->removeSession($this, $reason);
+        $this->onTerminate($reason);
+    }
+
+    abstract protected function onStart() : void;
+
+    abstract protected function onTerminate(string $reason) : void;
 }
