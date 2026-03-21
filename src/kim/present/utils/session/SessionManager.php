@@ -103,6 +103,15 @@ class SessionManager{
     }
 
     /**
+     * Returns the session class this manager handles.
+     *
+     * @return class-string<TSession>
+     */
+    public function getSessionClass() : string{
+        return $this->sessionClass;
+    }
+
+    /**
      * Retrieves the active session for a player.
      *
      * @param Player|int $playerOrId The player or their runtime ID.
