@@ -26,6 +26,7 @@ declare(strict_types=1);
 
 namespace kim\present\utils\session\listener;
 
+use kim\present\utils\session\listener\dispatcher\BaseSessionEventDispatcher;
 use pocketmine\event\HandlerListManager;
 use pocketmine\plugin\PluginBase;
 use pocketmine\utils\SingletonTrait;
@@ -42,7 +43,7 @@ use pocketmine\utils\SingletonTrait;
  * Intended to be used only by SessionManager. Direct use from plugin code is
  * discouraged.
  *
- * @see SessionEventDispatcher
+ * @see BaseSessionEventDispatcher
  * @see SessionEventListener
  */
 final class SessionEventListenerRegistry{
@@ -63,12 +64,12 @@ final class SessionEventListenerRegistry{
      * is attached to it. Otherwise, a new {@link SessionEventListener} is created,
      * the dispatcher is attached, and the listener is registered with PMMP.
      *
-     * @param SessionEventDispatcher $binding The dispatcher to attach.
-     * @param PluginBase             $plugin  The plugin used for PMMP listener registration.
+     * @param BaseSessionEventDispatcher $binding The dispatcher to attach.
+     * @param PluginBase                 $plugin  The plugin used for PMMP listener registration.
      *
      * @noinspection PhpDocMissingThrowsInspection
      */
-    public function attachBinding(SessionEventDispatcher $binding, PluginBase $plugin) : void{
+    public function attachBinding(BaseSessionEventDispatcher $binding, PluginBase $plugin) : void{
         if(isset($this->listeners[$binding->eventKey])){
             $this->listeners[$binding->eventKey]->attachBinding($binding);
             return;
@@ -96,9 +97,9 @@ final class SessionEventListenerRegistry{
      * remain on the listener after detachment, the listener is unregistered from
      * PMMP and removed from the registry.
      *
-     * @param SessionEventDispatcher $binding The dispatcher to detach.
+     * @param BaseSessionEventDispatcher $binding The dispatcher to detach.
      */
-    public function detachBinding(SessionEventDispatcher $binding) : void{
+    public function detachBinding(BaseSessionEventDispatcher $binding) : void{
         $listener = $this->listeners[$binding->eventKey] ?? null;
         if($listener === null){
             return;

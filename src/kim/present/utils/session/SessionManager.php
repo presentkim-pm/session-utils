@@ -27,7 +27,8 @@ declare(strict_types=1);
 namespace kim\present\utils\session;
 
 use kim\present\utils\session\listener\attribute\SessionEventHandler;
-use kim\present\utils\session\listener\SessionEventDispatcher;
+use kim\present\utils\session\listener\dispatcher\BaseSessionEventDispatcher;
+use kim\present\utils\session\listener\dispatcher\SessionMethodDispatcher;
 use kim\present\utils\session\listener\SessionEventListenerRegistry;
 use pocketmine\event\Event;
 use pocketmine\event\EventPriority;
@@ -50,7 +51,7 @@ use Throwable;
  * start/timeout/complete lifecycle.
  *
  * On construction, this manager scans the session class for {@link SessionEventHandler}
- * attributes and caches the resulting {@link SessionEventDispatcher} list. Each
+ * attributes and caches the resulting {@link BaseSessionEventDispatcher} list. Each
  * dispatcher is registered with {@link SessionEventListenerRegistry} once, ensuring
  * no duplicate PMMP listeners are created across multiple managers.
  *
@@ -81,7 +82,7 @@ class SessionManager{
      * Dispatchers collected from the session class at construction time.
      * Registered with SessionEventListenerRegistry on first use.
      *
-     * @var list<SessionEventDispatcher>
+     * @var list<BaseSessionEventDispatcher>
      */
     protected array $eventBindingList = [];
 
@@ -374,7 +375,7 @@ class SessionManager{
                     continue;
                 }
 
-                $this->eventBindingList[] = new SessionEventDispatcher(
+                $this->eventBindingList[] = new SessionMethodDispatcher(
                     sessionManager: $this,
                     eventClass: $handler->eventClass,
                     priority: $handler->priority,

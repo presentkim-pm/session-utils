@@ -24,23 +24,23 @@
 
 declare(strict_types=1);
 
-namespace kim\present\utils\session\listener;
+namespace kim\present\utils\session\listener\dispatcher;
 
 use kim\present\utils\session\SessionManager;
 use pocketmine\event\Event;
 use pocketmine\player\Player;
 
 /**
- * Represents a single session-scoped event handler binding.
+ * Base class for all session-scoped event dispatchers.
  *
- * Holds the full configuration needed to route a PMMP event to the correct
- * session method. Created by SessionManager during attribute scanning and
- * attached to a SessionEventListener via SessionEventListenerRegistry.
+ * Holds the listener configuration (eventClass, priority, handleCancelled)
+ * shared by all dispatcher types and defines the dispatch contract.
+ * Subclasses implement dispatch() to define what happens when the event fires.
  *
- * Each instance corresponds to one #[SessionEventHandler] attribute
- * declaration on a Session subclass method.
+ * @see SessionMethodDispatcher
+ * @see ManagerMethodDispatcher
  */
-final readonly class SessionEventDispatcher{
+abstract readonly class BaseSessionEventDispatcher{
 
     /**
      * Unique key identifying this dispatcher's listener configuration.
@@ -52,11 +52,11 @@ final readonly class SessionEventDispatcher{
     public string $eventKey;
 
     /**
-     * @param SessionManager              $sessionManager  The manager that owns the target sessions.
+     * @param SessionManager              $sessionManager  The manager that owns this dispatcher.
      * @param string                      $eventClass      Fully-qualified event class name to listen for.
      * @param int                         $priority        Event priority. See {@link EventPriority}.
      * @param bool                        $handleCancelled Whether to dispatch even if the event is cancelled.
-     * @param string                      $methodName      Name of the method to invoke on the session instance.
+     * @param string                      $methodName      Name of the method to invoke on dispatch.
      *
      * @phpstan-param class-string<Event> $eventClass      Fully-qualified event class name to listen for.
      */
@@ -65,7 +65,7 @@ final readonly class SessionEventDispatcher{
         public string $eventClass,
         public int $priority,
         public bool $handleCancelled,
-        public string $methodName,
+        public string $methodName
     ){
         if(!is_a($this->eventClass, Event::class, true)){
             throw new \InvalidArgumentException(
@@ -76,26 +76,13 @@ final readonly class SessionEventDispatcher{
     }
 
     /**
-     * Dispatches the event to the target player's session.
+     * Dispatches the event to the appropriate target.
      *
-     * Retrieves the session associated with the given player from the session
-     * manager and invokes the bound method on it. If no session exists for
-     * the player, the dispatch is silently skipped.
+     * Called by {@link SessionEventListener::onEvent()} after the player has
+     * been extracted from the event.
      *
-     * @param Event  $event  The event to dispatch.
-     * @param Player $player The player extracted from the event.
-     *
-     * @internal Called by SessionEventListener::onEvent().
-     *
+     * @internal
      */
-    public function dispatch(Event $event, Player $player) : void{
-        $session = $this->sessionManager->getSession($player);
-        if($session === null){
-            // No active session for this player, nothing to dispatch.
-            return;
-        }
-
-        $session->{$this->methodName}($event);
-    }
+    abstract public function dispatch(Event $event, Player $player) : void;
 
 }

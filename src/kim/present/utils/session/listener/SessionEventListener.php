@@ -26,6 +26,7 @@ declare(strict_types=1);
 
 namespace kim\present\utils\session\listener;
 
+use kim\present\utils\session\listener\dispatcher\BaseSessionEventDispatcher;
 use pocketmine\event\Cancellable;
 use pocketmine\event\Event;
 use pocketmine\event\RegisteredListener;
@@ -51,7 +52,7 @@ final class SessionEventListener{
      * Each dispatcher corresponds to one #[SessionEventHandler] binding
      * from a Session subclass.
      *
-     * @var array<int, SessionEventDispatcher>
+     * @var array<int, BaseSessionEventDispatcher>
      */
     private array $eventDispatchers = [];
 
@@ -95,9 +96,9 @@ final class SessionEventListener{
      * to an eventKey that already has a registered listener, avoiding duplicate
      * PMMP listener registration.
      *
-     * @param SessionEventDispatcher $binding The dispatcher to attach.
+     * @param BaseSessionEventDispatcher $binding The dispatcher to attach.
      */
-    public function attachBinding(SessionEventDispatcher $binding) : void{
+    public function attachBinding(BaseSessionEventDispatcher $binding) : void{
         $this->eventDispatchers[spl_object_id($binding)] = $binding;
     }
 
@@ -108,9 +109,9 @@ final class SessionEventListener{
      * If no dispatchers remain after detachment, the caller is responsible for
      * unregistering this listener from PMMP.
      *
-     * @param SessionEventDispatcher $binding The dispatcher to detach.
+     * @param BaseSessionEventDispatcher $binding The dispatcher to detach.
      */
-    public function detachBinding(SessionEventDispatcher $binding) : void{
+    public function detachBinding(BaseSessionEventDispatcher $binding) : void{
         unset($this->eventDispatchers[spl_object_id($binding)]);
     }
 
