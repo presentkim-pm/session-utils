@@ -133,14 +133,20 @@ final class SessionSequence{
     /**
      * Starts the sequence from the first step for the given player.
      *
+     * If the player is already in another step of this sequence, that session is
+     * terminated first with {@link SessionTerminateReasons::RESTART}.
+     *
      * @param Player $player The player to start the sequence for.
      */
     public function start(Player $player) : void{
-        $this->managers[0]->createSession($player);
+        $this->enterStep($player, 0);
     }
 
     /**
      * Starts the sequence from a specific step for the given player.
+     *
+     * If the player is already in another step of this sequence, that session is
+     * terminated first with {@link SessionTerminateReasons::RESTART}.
      *
      * @param Player           $player The player to start the sequence for.
      * @param int|class-string $step   Step index (0-based) or fully-qualified session class name.
@@ -148,7 +154,33 @@ final class SessionSequence{
      * @throws \InvalidArgumentException If the step index is out of range or the class is not in the sequence.
      */
     public function startFrom(Player $player, int|string $step) : void{
-        $this->managers[$this->resolveIndex($step)]->createSession($player);
+        $this->enterStep($player, $this->resolveIndex($step));
+    }
+
+    /**
+     * Returns the 0-based index of the step the player is currently in.
+     *
+     * @return int|null The step index, or null if the player is not in this sequence.
+     */
+    public function getCurrentStep(Player $player) : ?int{
+        foreach($this->managers as $i => $manager){
+            if($manager->getSession($player) !== null){
+                return $i;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Closes every step's manager: terminates all sessions and detaches all listeners.
+     * The sequence cannot be started afterwards. Managers also close themselves when the plugin is disabled.
+     *
+     * @param string $reason Termination reason. See {@link SessionTerminateReasons}.
+     */
+    public function close(string $reason = SessionTerminateReasons::PLUGIN_DISABLE) : void{
+        foreach($this->managers as $manager){
+            $manager->close($reason);
+        }
     }
 
     /**
@@ -176,6 +208,18 @@ final class SessionSequence{
     // -------------------------------------------------------------------------
     // Private
     // -------------------------------------------------------------------------
+
+    /**
+     * Terminates the player's sessions in every other step, then creates a session in the given step.
+     */
+    private function enterStep(Player $player, int $index) : void{
+        foreach($this->managers as $i => $manager){
+            if($i !== $index){
+                $manager->removeSession($player, SessionTerminateReasons::RESTART);
+            }
+        }
+        $this->managers[$index]->createSession($player);
+    }
 
     /**
      * Chains managers together in order and sets the exhausted callback on the last one.

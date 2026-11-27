@@ -71,6 +71,9 @@ abstract class SequenceSession extends Session{
      * @param string $reason Termination reason forwarded to {@link onTerminate()}.
      */
     final protected function next(string $reason = SessionTerminateReasons::COMPLETED) : void{
+        if(!$this->isActive()){
+            return; // Already terminated (e.g. restarted or removed); must not advance the player again.
+        }
         $this->sessionManager->progressNext($this->getPlayer(), $reason);
     }
 

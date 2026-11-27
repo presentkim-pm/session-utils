@@ -33,11 +33,13 @@ use kim\present\utils\session\listener\dispatcher\SessionMethodDispatcher;
 use kim\present\utils\session\listener\SessionEventListenerRegistry;
 use pocketmine\event\Event;
 use pocketmine\event\EventPriority;
+use pocketmine\event\HandlerListManager;
+use pocketmine\event\plugin\PluginDisableEvent;
 use pocketmine\event\player\PlayerJoinEvent;
 use pocketmine\event\player\PlayerQuitEvent;
+use pocketmine\event\RegisteredListener;
 use pocketmine\player\Player;
 use pocketmine\plugin\PluginBase;
-use pocketmine\utils\Utils;
 use ReflectionClass;
 use ReflectionMethod;
 use Throwable;
@@ -53,7 +55,14 @@ use Throwable;
  * On construction, this manager scans the session class for {@link SessionEventHandler}
  * attributes and caches the resulting {@link BaseSessionEventDispatcher} list. Each
  * dispatcher is registered with {@link SessionEventListenerRegistry} once, ensuring
- * no duplicate PMMP listeners are created across multiple managers.
+ * no duplicate PMMP listeners are created across multiple managers of the same plugin.
+ *
+ * If the session class implements {@link LifecycleSession}, sessions are also created
+ * for the players that are already online when the manager is constructed (e.g. when the
+ * plugin is enabled late or reloaded), so that no player is left without a session.
+ *
+ * The manager closes itself automatically when its plugin is disabled. {@link close()}
+ * terminates every session and detaches all listeners; a closed manager cannot create sessions.
  *
  * @template TPlugin of PluginBase
  * @template TSession of Session
@@ -100,6 +109,12 @@ class SessionManager{
      */
     private ?\Closure $onSessionTerminated = null;
 
+    /** Whether {@link close()} has been called. */
+    private bool $closed = false;
+
+    /** Listener that closes this manager when its plugin is disabled. */
+    private ?RegisteredListener $disableListener = null;
+
     /**
      * @param PluginBase                     $plugin       The plugin that owns this manager.
      * @param string                         $sessionClass The session class this manager handles.
@@ -116,6 +131,8 @@ class SessionManager{
         $this->collectSessionLifecycleBindings();
         $this->collectSessionEventBindings();
         $this->registerEventBindings();
+        $this->registerDisableListener();
+        $this->createSessionsForOnlinePlayers();
     }
 
     /**
@@ -145,7 +162,9 @@ class SessionManager{
      * Creates a new session for a player.
      *
      * If a session already exists for the player, the existing session is returned.
-     * On instantiation failure, the error is logged and null is returned.
+     * On instantiation or start failure, the error is logged and null is returned. A session whose
+     * start failed is terminated with {@link SessionTerminateReasons::START_FAILED} and
+     * the onSessionCreated callback is not invoked.
      *
      * @param Player $player  The player to create a session for.
      * @param mixed  ...$args Additional arguments forwarded to the session constructor.
@@ -153,8 +172,14 @@ class SessionManager{
      * @return Session|null The created or existing session, or null on failure.
      *
      * @phpstan-return TSession|null The created or existing session, or null on failure.
+     *
+     * @throws \LogicException If this manager has been closed.
      */
     public function createSession(Player $player, mixed ...$args) : ?Session{
+        if($this->closed){
+            throw new \LogicException("Cannot create a session: the manager of $this->sessionClass is closed.");
+        }
+
         $playerId = $player->getId();
         if(isset($this->sessions[$playerId])){
             return $this->sessions[$playerId];
@@ -162,18 +187,35 @@ class SessionManager{
 
         try{
             $session = $this->instantiateSession($player, ...$args);
-            $this->sessions[$playerId] = $session;
-            $session->start();
-
-            if($this->onSessionCreated !== null){
-                ($this->onSessionCreated)($session);
-            }
-            return $session;
         }catch(Throwable $e){
-            unset($this->sessions[$playerId]);
-            $this->plugin->getLogger()->error("$this->sessionClass: " . $e->getMessage());
+            $this->logFailure("Failed to create session", $e);
             return null;
         }
+
+        $this->sessions[$playerId] = $session;
+        try{
+            $session->start();
+        }catch(Throwable $e){
+            if(($this->sessions[$playerId] ?? null) === $session){
+                unset($this->sessions[$playerId]);
+            }
+            $this->logFailure("Failed to start session", $e);
+            try{
+                $session->finalizeTermination(SessionTerminateReasons::START_FAILED);
+            }catch(Throwable $e){
+                $this->logFailure("Session onTerminate() failed after a failed start", $e);
+            }
+            return null;
+        }
+
+        if($this->onSessionCreated !== null){
+            try{
+                ($this->onSessionCreated)($session);
+            }catch(Throwable $e){
+                $this->logFailure("onSessionCreated callback failed", $e);
+            }
+        }
+        return $session;
     }
 
     /**
@@ -203,6 +245,8 @@ class SessionManager{
      * @param Player $player The player to get or create a session for.
      *
      * @return TSession|null The existing or newly created session, or null on failure.
+     *
+     * @throws \LogicException If this manager has been closed and the player has no session.
      */
     public function getOrCreateSession(Player $player) : ?Session{
         return $this->getSession($player) ?? $this->createSession($player);
@@ -230,32 +274,30 @@ class SessionManager{
      * @phpstan-param TSession|Player $session The session or player to remove.
      */
     public function removeSession(Session|Player $session, string $reason = SessionTerminateReasons::MANUAL) : void{
-        if($session instanceof Player){
-            $playerId = $session->getId();
-            if(isset($this->sessions[$playerId])){
-                $session = $this->sessions[$playerId];
-            }else{
-                return;
-            }
-        }elseif(!isset($this->sessions[$session->getPlayer()->getId()])){
+        $playerId = $session instanceof Player ? $session->getId() : $session->getPlayer()->getId();
+        $stored = $this->sessions[$playerId] ?? null;
+        if($stored === null || ($session instanceof Session && $stored !== $session)){
+            // Nothing to remove, or a stale session object of the same player: the current one must stay.
             return;
         }
+        $session = $stored;
 
-        // Unregister from sessions map first to prevent re-entry from terminate().
-        unset($this->sessions[$session->getPlayer()->getId()]);
+        // Unregister from sessions map first to prevent re-entry.
+        unset($this->sessions[$playerId]);
 
+        // onTerminate() always runs before the onSessionTerminated callback.
         try{
-            if($session->isActive()){
-                $session->terminate($reason);
-            }
+            $session->finalizeTermination($reason);
         }catch(Throwable $e){
-            $this->plugin->getLogger()->error(
-                "Session terminate() failed [$session::class]: " . $e->getMessage()
-            );
+            $this->logFailure("Session onTerminate() failed [" . $session::class . "]", $e);
         }
 
         if($this->onSessionTerminated !== null){
-            ($this->onSessionTerminated)($session, $reason);
+            try{
+                ($this->onSessionTerminated)($session, $reason);
+            }catch(Throwable $e){
+                $this->logFailure("onSessionTerminated callback failed", $e);
+            }
         }
     }
 
@@ -277,10 +319,12 @@ class SessionManager{
     /**
      * Registers a callback invoked after a session is created and started.
      *
+     * The callback may type its parameter with the concrete session class.
+     * Not invoked when the session fails to start.
+     *
      * @param \Closure(TSession): void $callback
      */
     public function onSessionCreated(\Closure $callback) : self{
-        Utils::validateCallableSignature(function(Session $session){}, $callback);
         $this->onSessionCreated = $callback;
         return $this;
     }
@@ -291,9 +335,39 @@ class SessionManager{
      * @param \Closure(TSession, string): void $callback
      */
     public function onSessionTerminated(\Closure $callback) : self{
-        Utils::validateCallableSignature(function(Session $session, string $reason){}, $callback);
         $this->onSessionTerminated = $callback;
         return $this;
+    }
+
+    /**
+     * Terminates all sessions and detaches this manager from the event system.
+     *
+     * Called automatically when the owning plugin is disabled. Idempotent: calling it again is a no-op.
+     * After closing, {@link createSession()} throws a {@link \LogicException}.
+     *
+     * @param string $reason Termination reason. See {@link SessionTerminateReasons}.
+     */
+    public function close(string $reason = SessionTerminateReasons::PLUGIN_DISABLE) : void{
+        if($this->closed){
+            return;
+        }
+        $this->closed = true;
+
+        $this->terminateAll($reason);
+
+        $registry = SessionEventListenerRegistry::getInstance();
+        foreach($this->eventBindingList as $binding){
+            $registry->detachBinding($binding);
+        }
+        if($this->disableListener !== null){
+            HandlerListManager::global()->unregisterAll($this->disableListener);
+            $this->disableListener = null;
+        }
+    }
+
+    /** Returns whether {@link close()} has been called. */
+    public function isClosed() : bool{
+        return $this->closed;
     }
 
     /** @internal Called by ManagerMethodDispatcher. */
@@ -318,6 +392,47 @@ class SessionManager{
      */
     private function instantiateSession(Player $player, mixed ...$args) : Session{
         return new ($this->sessionClass)($this, $player, ...$args);
+    }
+
+    /**
+     * Logs a failure with the exception's trace through the plugin logger.
+     */
+    private function logFailure(string $message, Throwable $e) : void{
+        $logger = $this->plugin->getLogger();
+        $logger->error("$message in $this->sessionClass: " . $e->getMessage());
+        $logger->logException($e);
+    }
+
+    /**
+     * Closes this manager when its own plugin is disabled.
+     *
+     * PluginManager::disablePlugin() fires PluginDisableEvent before it unregisters the plugin's listeners.
+     */
+    private function registerDisableListener() : void{
+        $this->disableListener = $this->plugin->getServer()->getPluginManager()->registerEvent(
+            PluginDisableEvent::class,
+            function(PluginDisableEvent $event) : void{
+                if($event->getPlugin() === $this->plugin){
+                    $this->close();
+                }
+            },
+            EventPriority::MONITOR,
+            $this->plugin
+        );
+    }
+
+    /**
+     * Creates sessions for already-online players if the session class is a {@link LifecycleSession}.
+     */
+    private function createSessionsForOnlinePlayers() : void{
+        if(!is_a($this->sessionClass, LifecycleSession::class, true)){
+            return;
+        }
+        foreach($this->plugin->getServer()->getOnlinePlayers() as $player){
+            if($player->isOnline()){
+                $this->createSession($player);
+            }
+        }
     }
 
     /**

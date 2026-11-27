@@ -35,10 +35,15 @@ use pocketmine\utils\SingletonTrait;
  * Central registry for session-scoped event listeners.
  *
  * This singleton ensures that only one {@link SessionEventListener} exists per
- * unique eventKey (eventClass + priority + handleCancelled). When multiple
- * SessionManagers register handlers for the same event configuration, the registry
- * prevents duplicate PMMP listener registration by attaching dispatchers to the
- * existing listener instead of creating a new one.
+ * unique (plugin, eventKey) pair, where eventKey is eventClass + priority + handleCancelled.
+ * When multiple SessionManagers of the same plugin register handlers for the same event
+ * configuration, the registry prevents duplicate PMMP listener registration by attaching
+ * dispatchers to the existing listener instead of creating a new one.
+ *
+ * Listeners are never shared between plugins: PMMP unregisters a plugin's listeners when
+ * it is disabled, so a listener shared across plugins would silently stop serving the
+ * other plugins' sessions. This matters when the library is installed through Composer
+ * and a single copy of the classes is used by several plugins.
  *
  * Intended to be used only by SessionManager. Direct use from plugin code is
  * discouraged.
@@ -50,7 +55,7 @@ final class SessionEventListenerRegistry{
     use SingletonTrait;
 
     /**
-     * Active listeners keyed by eventKey.
+     * Active listeners keyed by "{spl_object_id(plugin)}|{eventKey}".
      * An entry is removed when its listener has no remaining dispatchers.
      *
      * @var array<string, SessionEventListener>
@@ -58,20 +63,34 @@ final class SessionEventListenerRegistry{
     private array $listeners = [];
 
     /**
+     * Registry key of the listener each attached dispatcher belongs to, keyed by spl_object_id of the dispatcher.
+     *
+     * @var array<int, string>
+     */
+    private array $bindingKeys = [];
+
+    /**
      * Attaches a dispatcher to the registry.
      *
-     * If a listener for the dispatcher's eventKey already exists, the dispatcher
+     * If a listener for the plugin and the dispatcher's eventKey already exists, the dispatcher
      * is attached to it. Otherwise, a new {@link SessionEventListener} is created,
-     * the dispatcher is attached, and the listener is registered with PMMP.
+     * the dispatcher is attached, and the listener is registered with PMMP under the given plugin.
      *
      * @param BaseSessionEventDispatcher $binding The dispatcher to attach.
-     * @param PluginBase                 $plugin  The plugin used for PMMP listener registration.
+     * @param PluginBase                 $plugin  The plugin that owns the dispatcher and the PMMP listener.
      *
      * @noinspection PhpDocMissingThrowsInspection
      */
     public function attachBinding(BaseSessionEventDispatcher $binding, PluginBase $plugin) : void{
-        if(isset($this->listeners[$binding->eventKey])){
-            $this->listeners[$binding->eventKey]->attachBinding($binding);
+        $key = spl_object_id($plugin) . '|' . $binding->eventKey;
+        $bindingId = spl_object_id($binding);
+        if(isset($this->bindingKeys[$bindingId])){
+            return; // Already attached.
+        }
+
+        if(isset($this->listeners[$key])){
+            $this->listeners[$key]->attachBinding($binding);
+            $this->bindingKeys[$bindingId] = $key;
             return;
         }
 
@@ -87,7 +106,8 @@ final class SessionEventListenerRegistry{
             $binding->handleCancelled
         );
         $listener->setRegisteredListener($registeredListener);
-        $this->listeners[$binding->eventKey] = $listener;
+        $this->listeners[$key] = $listener;
+        $this->bindingKeys[$bindingId] = $key;
     }
 
     /**
@@ -100,7 +120,14 @@ final class SessionEventListenerRegistry{
      * @param BaseSessionEventDispatcher $binding The dispatcher to detach.
      */
     public function detachBinding(BaseSessionEventDispatcher $binding) : void{
-        $listener = $this->listeners[$binding->eventKey] ?? null;
+        $bindingId = spl_object_id($binding);
+        $key = $this->bindingKeys[$bindingId] ?? null;
+        if($key === null){
+            return;
+        }
+        unset($this->bindingKeys[$bindingId]);
+
+        $listener = $this->listeners[$key] ?? null;
         if($listener === null){
             return;
         }
@@ -111,9 +138,9 @@ final class SessionEventListenerRegistry{
         if(!$listener->hasDispatchers()){
             $registeredListener = $listener->getRegisteredListener();
             if($registeredListener !== null){
-                HandlerListManager::global()->unregisterAll($listener->getRegisteredListener());
+                HandlerListManager::global()->unregisterAll($registeredListener);
             }
-            unset($this->listeners[$binding->eventKey]);
+            unset($this->listeners[$key]);
         }
     }
 

@@ -59,13 +59,34 @@ abstract class Session{
         $this->onStart();
     }
 
+    /**
+     * Terminates this session. Calling it on an already terminated session is a no-op.
+     *
+     * The termination always runs in the same order: {@link onTerminate()} first, then the
+     * manager's onSessionTerminated callback, each exactly once.
+     */
     final public function terminate(string $reason = SessionTerminateReasons::MANUAL) : void{
         if(!$this->active){
             return;
         }
 
-        $this->active = false;
         $this->sessionManager->removeSession($this, $reason);
+
+        // The manager did not know this session (e.g. it never made it into the manager). Finish it here.
+        $this->finalizeTermination($reason);
+    }
+
+    /**
+     * Marks this session as terminated and calls {@link onTerminate()}. Does nothing if already terminated.
+     *
+     * @internal Called by {@link SessionManager}; use {@link terminate()} instead.
+     */
+    final public function finalizeTermination(string $reason) : void{
+        if(!$this->active){
+            return;
+        }
+
+        $this->active = false;
         $this->onTerminate($reason);
     }
 
